@@ -15,6 +15,9 @@ import json
 import os
 import re
 import datetime
+import sys
+import traceback
+import subprocess
 import pandas as pd
 import numpy as np
 import matplotlib
@@ -31,8 +34,10 @@ tf.test.gpu_device_name()
 
 try:
     import mlflow
+    mlflow_import_error = None
 except Exception:
     mlflow = None
+    mlflow_import_error = traceback.format_exc()
 
 
 def normalize_cfg_paths(cfg, train_dir, output_dir):
@@ -69,13 +74,35 @@ def _mlflow_param_value(v):
     return json.dumps(v)
 
 
+def _experiment_name_from_output_dir(path):
+    name = os.path.basename(os.path.normpath(path))
+    m = re.match(r"model_(\d+)$", name)
+    if m:
+        return "model{}".format(m.group(1))
+    return name or "pix2pix3d-ct"
+
+
 ########################################################################
 # * Configuration
 ########################################################################
 ### define paths
 base_dir = r'/home/cet/pix2pix/pix2pix3d-ct/rat_data'
 train_dir = r'/home/cet/pix2pix/pix2pix3d-ct/rat_data/train'
-output_dir = base_dir + '/result'
+
+root = r"/home/cet/pix2pix/models"  # root dir for outputs
+os.makedirs(root, exist_ok=True)
+
+nums=[]
+for name in os.listdir(root):
+    m = re.match(r"model_(\d+)$",name)
+    if m:
+        nums.append(int(m.group(1)))
+next_num = max(nums,default = 0) + 1
+model_name = f"model_{next_num}"
+
+output_dir = os.path.join(root, model_name)
+
+os.makedirs(output_dir, exist_ok=True)
 
 
 ### load config OR create a new one
@@ -191,13 +218,27 @@ else:
 # * Train
 ########################################################################
 mlflow_active = mlflow is not None
+print("Python executable:", sys.executable)
 if mlflow_active:
-    tracking_dir = os.path.join(output_dir, "mlruns")
+    tracking_dir = os.environ.get("MLFLOW_TRACKING_DIR", "/home/cet/pix2pix/mlruns")
     os.makedirs(tracking_dir, exist_ok=True)
     mlflow.set_tracking_uri("file://" + os.path.abspath(tracking_dir))
-    mlflow.set_experiment("pix2pix3d-ct")
-    run_name = datetime.datetime.now().strftime("train-%Y%m%d-%H%M%S")
+    mlflow_experiment = "pix2pix3d-ct"
+    mlflow.set_experiment(mlflow_experiment)
+    run_name = model_name
     mlflow.start_run(run_name=run_name)
+    run_id = mlflow.active_run().info.run_id
+    # Save run id in both model dir and shared tracking root for infer resume.
+    run_id_files = [
+        os.path.join(output_dir, "mlflow_last_run_id.txt"),
+        os.path.join(os.path.dirname(os.path.abspath(tracking_dir)), "mlflow_last_run_id.txt"),
+    ]
+    for run_id_file in run_id_files:
+        with open(run_id_file, "w") as f:
+            f.write(run_id + "\n")
+    print("MLflow experiment:", mlflow_experiment)
+    print("MLflow tracking dir:", os.path.abspath(tracking_dir))
+    print("MLflow run id:", run_id)
     mlflow.set_tags({
         "project": "pix2pix3d-ct",
         "stage": "train",
@@ -209,6 +250,8 @@ if mlflow_active:
     mlflow.log_param("val_cases", int(len(DL.case_split[1])))
 else:
     print("MLflow not installed; proceeding without experiment tracking.")
+    if mlflow_import_error:
+        print(mlflow_import_error)
 
 def _metric_logger(metrics_dict, step):
     if mlflow_active:
@@ -240,3 +283,21 @@ finally:
         if os.path.isdir(debug_dir):
             mlflow.log_artifacts(debug_dir, artifact_path="debug_input")
         mlflow.end_run(status=run_status)
+
+########################################################################
+# * Post-Training Inference (Auto-Run)
+########################################################################
+def run_post_training_inference():
+    infer_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "infer.py")
+    env = os.environ.copy()
+    env.setdefault("MLFLOW_TRACKING_DIR", "/home/cet/pix2pix/mlruns")
+    # Prevent inherited env from forcing a mismatched run/experiment in infer.
+    env.pop("MLFLOW_RUN_ID", None)
+    env.pop("MLFLOW_EXPERIMENT_ID", None)
+    env.pop("MLFLOW_EXPERIMENT_NAME", None)
+    print("Starting automatic inference:", infer_script)
+    subprocess.run([sys.executable, infer_script], check=True, env=env)
+
+
+if run_status == "FINISHED":
+    run_post_training_inference()

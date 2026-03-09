@@ -33,7 +33,7 @@ window2 = [(8000, 3000)]
 
 
 batch_size = 3
-epochs = 100
+epochs = 1
 
 
 optimizer = 'adam'

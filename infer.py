@@ -15,6 +15,9 @@ import glob
 import numpy as np
 import os
 import datetime
+import sys
+import traceback
+import re
 import pandas as pd
 import utils
 
@@ -24,21 +27,72 @@ from source.my3dpix2pix import My3dPix2Pix
 import tensorflow as tf
 try:
     import mlflow
+    mlflow_import_error = None
 except Exception:
     mlflow = None
+    mlflow_import_error = traceback.format_exc()
 
 
-def load_inference_config(spath):
-    json_files = sorted(glob.glob(os.path.join(spath, '*.json')))
+def load_inference_config(search_roots):
+    if isinstance(search_roots, str):
+        search_roots = [search_roots]
+
+    json_files = []
+    for root in search_roots:
+        if not root:
+            continue
+        json_files.extend(glob.glob(os.path.join(root, '**', 'cfg_*.json'), recursive=True))
+        json_files.extend(glob.glob(os.path.join(root, '*.json')))
+    json_files = sorted(set(json_files))
     if not json_files:
-        raise FileNotFoundError("No JSON config found in {}".format(spath))
+        raise FileNotFoundError("No JSON config found in {}".format(search_roots))
 
     # Deterministic selection: use most recently modified config.
     json_files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     cfg_path = json_files[0]
     print("Using config:", cfg_path)
     with open(cfg_path) as json_file:
-        return json.load(json_file)
+        return json.load(json_file), cfg_path
+
+
+def resolve_mlflow_context_dir(spath, cfg_path):
+    # Prefer config directory (usually the exact training output dir).
+    candidates = [
+        os.path.dirname(cfg_path),
+        spath,
+        os.path.dirname(spath),
+    ]
+    for c in candidates:
+        if c and os.path.isdir(c):
+            return c
+    return spath
+
+
+def find_resume_run_id(context_dir):
+    # 1) Explicit env override.
+    env_id = os.environ.get("MLFLOW_RUN_ID")
+    if env_id:
+        return env_id
+
+    # 2) Standard marker in context dir.
+    run_id_file = os.path.join(context_dir, "mlflow_last_run_id.txt")
+    if os.path.exists(run_id_file):
+        with open(run_id_file, "r") as f:
+            return f.read().strip()
+
+    # 3) One level up fallback (when infer/train paths differ by one level).
+    parent_run_id_file = os.path.join(os.path.dirname(context_dir), "mlflow_last_run_id.txt")
+    if os.path.exists(parent_run_id_file):
+        with open(parent_run_id_file, "r") as f:
+            return f.read().strip()
+
+    # 4) shared fallback used by training script.
+    shared_run_id_file = "/home/cet/pix2pix/mlflow_last_run_id.txt"
+    if os.path.exists(shared_run_id_file):
+        with open(shared_run_id_file, "r") as f:
+            return f.read().strip()
+
+    return None
 
 
 def dataframe_matches_disk(df, cts):
@@ -75,6 +129,19 @@ def _log_case_metrics(metrics_list, prefix):
     })
 
 
+def _experiment_name_from_context_dir(path):
+    name = os.path.basename(os.path.normpath(path))
+    m = re.match(r"model_(\d+)$", name)
+    if m:
+        return "model{}".format(m.group(1))
+    return name or "pix2pix3d-ct"
+
+
+def _model_output_prefix(path):
+    name = os.path.basename(os.path.normpath(path))
+    return name or "model"
+
+
 ########################################################################
 # * Test data
 ########################################################################
@@ -83,23 +150,45 @@ base_dir = r"/home/cet/pix2pix/pix2pix3d-ct/rat_data"
 test_dir = r"/home/cet/pix2pix/pix2pix3d-ct/rat_data/test"
 
 # load config
-spath = r"/home/cet/pix2pix/pix2pix3d-ct/rat_data/result"
-cfg = load_inference_config(spath)
+models_root = os.environ.get("PIX2PIX_MODELS_ROOT", "/home/cet/pix2pix/models")
+legacy_root = r"/home/cet/pix2pix/pix2pix3d-ct/rat_data/result"
+cfg, cfg_path = load_inference_config([models_root, legacy_root])
+model_dir = os.path.dirname(cfg_path)
+mlflow_context_dir = resolve_mlflow_context_dir(model_dir, cfg_path)
 
 mlflow_active = mlflow is not None
+print("Python executable:", sys.executable)
+mlflow_resumed_run = False
 if mlflow_active:
-    tracking_dir = os.path.join(spath, "mlruns")
+    tracking_dir = os.environ.get("MLFLOW_TRACKING_DIR", "/home/cet/pix2pix/mlruns")
     os.makedirs(tracking_dir, exist_ok=True)
     mlflow.set_tracking_uri("file://" + os.path.abspath(tracking_dir))
-    mlflow.set_experiment("pix2pix3d-ct")
-    run_name = datetime.datetime.now().strftime("infer-%Y%m%d-%H%M%S")
-    mlflow.start_run(run_name=run_name)
+    resume_run_id = find_resume_run_id(mlflow_context_dir)
+    if resume_run_id:
+        print("Resuming MLflow run:", resume_run_id)
+        # Do not set experiment before resuming by run_id.
+        mlflow.start_run(run_id=resume_run_id)
+        mlflow_resumed_run = True
+        resumed_exp_id = mlflow.active_run().info.experiment_id
+        resumed_exp = mlflow.get_experiment(resumed_exp_id)
+        mlflow_experiment = resumed_exp.name if resumed_exp is not None else str(resumed_exp_id)
+    else:
+        mlflow_experiment = "pix2pix3d-ct"
+        mlflow.set_experiment(mlflow_experiment)
+        run_name = _model_output_prefix(mlflow_context_dir)
+        mlflow.start_run(run_name=run_name)
+        print("No training run id found; started new infer run.")
+    print("MLflow tracking dir:", os.path.abspath(tracking_dir))
+    print("MLflow experiment:", mlflow_experiment)
     mlflow.set_tags({
         "project": "pix2pix3d-ct",
         "stage": "infer",
+        "has_inference_metrics": "true",
     })
 else:
     print("MLflow not installed; proceeding without experiment tracking.")
+    if mlflow_import_error:
+        print(mlflow_import_error)
 
 # your own test set and names of ct folders
 cfg['df_test'] = os.path.join(test_dir, 'select.ftr')
@@ -137,7 +226,7 @@ DL = MyDataLoader(df_test_modify, cts=cfg['cts'], img_shape=cfg['img_shape'],
 
 
 ### GAN
-gan = My3dPix2Pix(DL, savepath=spath, L_weights=cfg['L_weights'], opt=cfg['opt'], lrs=cfg['lrs'],
+gan = My3dPix2Pix(DL, savepath=model_dir, L_weights=cfg['L_weights'], opt=cfg['opt'], lrs=cfg['lrs'],
                   smoothlabel=cfg['smoothlabel'], fmloss=cfg['fmloss'],
                   gennoise=cfg['gennoise'],
                   randomshift=cfg['randomshift'], resoutput=cfg['resoutput'], dropout=cfg['dropout'],
@@ -148,14 +237,22 @@ gan = My3dPix2Pix(DL, savepath=spath, L_weights=cfg['L_weights'], opt=cfg['opt']
 # Load final weights
 loaded_weights = gan.load_final_weights()
 if not loaded_weights:
-    raise FileNotFoundError("No trained weights found in {}".format(os.path.join(spath, "models")))
+    raise FileNotFoundError("No trained weights found in {}".format(os.path.join(model_dir, "models")))
 print("Loaded weights:", loaded_weights)
 if mlflow_active:
-    mlflow.log_params({k: _mlflow_param_value(v) for k, v in cfg.items()})
-    mlflow.log_param("loaded_weights", str(loaded_weights))
+    if not mlflow_resumed_run:
+        mlflow.log_params({k: _mlflow_param_value(v) for k, v in cfg.items()})
+        mlflow.log_param("loaded_weights", str(loaded_weights))
+    # Params are immutable on resumed runs; use tags for inference metadata.
+    mlflow.set_tag("infer_loaded_weights", str(loaded_weights))
+    mlflow.set_tag("infer_data_format", str(cfg.get("data_format", "unknown")))
+    mlflow.set_tag("infer_cts", str(cfg.get("cts", "")))
+
+model_output_prefix = _model_output_prefix(mlflow_context_dir)
 
 ## make directory for test results inside result/YOURFOLDER
-savedir = gan.make_directory('TESTDIRECTORY')
+savedir = gan.make_directory('{}_infer'.format(model_output_prefix))
+print("Inference output dir:", savedir)
 split = 0
 L = gan.data_loader.case_split[split]
 choice = np.arange(len(L))
@@ -216,7 +313,7 @@ try:
                           splitvar=cfg['splitvar'])
 
         ### GAN
-        gan = My3dPix2Pix(DL, savepath=spath, L_weights=cfg['L_weights'], opt=cfg['opt'], lrs=cfg['lrs'],
+        gan = My3dPix2Pix(DL, savepath=model_dir, L_weights=cfg['L_weights'], opt=cfg['opt'], lrs=cfg['lrs'],
                           smoothlabel=cfg['smoothlabel'], fmloss=cfg['fmloss'],
                           gennoise=cfg['gennoise'],
                           randomshift=cfg['randomshift'], resoutput=cfg['resoutput'], dropout=cfg['dropout'],
@@ -224,10 +321,11 @@ try:
 
         loaded_weights = gan.load_final_weights()
         if not loaded_weights:
-            raise FileNotFoundError("No trained weights found in {}".format(os.path.join(spath, "models")))
+            raise FileNotFoundError("No trained weights found in {}".format(os.path.join(model_dir, "models")))
         print("Loaded weights:", loaded_weights)
 
-        savedir = gan.make_directory('TESTDIRECTORY2')
+        savedir = gan.make_directory('{}_infer_additional'.format(model_output_prefix))
+        print("Inference additional output dir:", savedir)
         split = 0
         L = gan.data_loader.case_split[split]
         choice = np.arange(len(L))
