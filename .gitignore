@@ -2,6 +2,6 @@
 __pycache__
 dicom/*
 result/*
-rat_data/
-env/
-models/
+D:/AdityaG/pix2pix/pix2pix3d-ct/rat_data/
+D:/AdityaG/pix2pix/pix2pix3d-ct/env/
+D:/AdityaG/pix2pix/pix2pix3d-ct/models/
