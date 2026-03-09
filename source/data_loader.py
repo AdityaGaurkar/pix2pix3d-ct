@@ -69,6 +69,7 @@ class MyDataLoader():
         self.window2 = window2
         self.rescale_intensity = rescale_intensity
         self.splitvar = splitvar
+        self._volume_cache = {}
 
         def slice_count(x):
             r"""
@@ -78,16 +79,33 @@ class MyDataLoader():
 
             :return: DataFrame with added 'slice_pos' (slice position) and 'slice_num' (slice number) columns.
             """
-            # Extract the last component of 'ImagePosition(Patient)' and convert to float
-            x['xx'] = x['ImagePosition(Patient)'].apply(
-                lambda x: [str(n).strip() for n in ast.literal_eval(x)][-1]).astype(float)
+            if 'slice_num' in x.columns:
+                x['slice_num'] = x['slice_num'].astype(int)
+                M = x['slice_num'].max()
+                m = x['slice_num'].min()
+                if M == m:
+                    x['slice_pos'] = 0.0
+                else:
+                    x['slice_pos'] = (x['slice_num'] - m) / (M - m)
+                return x
+
+            if 'zpos' in x.columns:
+                x['xx'] = x['zpos'].astype(float)
+            elif 'ImagePosition(Patient)' in x.columns:
+                x['xx'] = x['ImagePosition(Patient)'].apply(
+                    lambda v: [str(n).strip() for n in ast.literal_eval(v)][-1]).astype(float)
+            else:
+                raise ValueError("DataFrame must contain either 'slice_num', 'zpos', or 'ImagePosition(Patient)'")
             
             # Calculate maximum and minimum values of 'xx'
             M = x['xx'].max()
             m = x['xx'].min()
             
             # Calculate 'slice_pos' based on 'xx' values
-            x['slice_pos'] = (M - x['xx']) / (M - m)
+            if M == m:
+                x['slice_pos'] = 0.0
+            else:
+                x['slice_pos'] = (M - x['xx']) / (M - m)
             
             # Calculate 'slice_num' based on ranking of 'xx' values
             x['slice_num'] = x['xx'].rank(method='min', ascending=False).astype(int) - 1
@@ -104,13 +122,26 @@ class MyDataLoader():
         self.df = self.df.reset_index(drop=True)
         self.df = self.df.sort_values(by=['pid', 'ct', 'slice_num'])
         self.df = self.df.reset_index(drop=True)
-        tpid, tfilepath, self.rows, self.cols, self.rescale_in, self.rescale_sl = self.df.iloc[0][
-            ['pid', 'filepath', 'Rows', 'Columns', 'RescaleIntercept', 'RescaleSlope']]
+        first_row = self.df.iloc[0]
+        tpid = first_row['pid']
+        tfilepath = first_row['filepath']
+        self.rescale_in = float(first_row.get('RescaleIntercept', 0.0))
+        self.rescale_sl = float(first_row.get('RescaleSlope', 1.0))
+        first_arr = self._read_slice_file(tfilepath)
+        first_hwd = self._to_hwd(first_arr)
+        self.rows = int(first_hwd.shape[0])
+        self.cols = int(first_hwd.shape[1])
+        self.volume_mode = 'Depth' in self.df.columns or first_hwd.shape[2] > 1 and \
+            self.df.groupby(['pid', 'ct']).size().max() == 1
+
         tsplit = tfilepath.split(os.sep)
         self.basedir = os.path.join(*tsplit[:tsplit.index(tpid)])
 
         qstring = 'ct=="' + self.cts[0] + '"'
-        dff = self.df.query(qstring).groupby('pid')['slice_num'].max() + 1
+        if 'Depth' in self.df.columns:
+            dff = self.df.query(qstring).groupby('pid')['Depth'].max().astype(int)
+        else:
+            dff = self.df.query(qstring).groupby('pid')['slice_num'].max() + 1
         # print(dff)
         self.case_list = [(k, dff[k]) for k in dff.index.tolist()]
         # print(self.case_list)
@@ -121,6 +152,55 @@ class MyDataLoader():
 
         # get total_samples
         self.total_samples = self.get_total_samples()
+
+
+    @staticmethod
+    def _read_slice_file(filepath):
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext == '.npy':
+            arr = np.load(filepath)
+            if arr.ndim == 3 and arr.shape[-1] == 1:
+                arr = np.squeeze(arr, axis=-1)
+            return arr
+        return pydicom.dcmread(filepath).pixel_array
+
+
+    def _to_hwd(self, arr):
+        if arr.ndim == 2:
+            return np.expand_dims(arr, axis=-1)
+        if arr.ndim != 3:
+            raise ValueError("Expected 2D or 3D array, got shape {}".format(arr.shape))
+
+        # Already H, W, D
+        if arr.shape[0] >= arr.shape[2] and arr.shape[1] >= arr.shape[2]:
+            return arr
+
+        # D, H, W -> H, W, D
+        return np.moveaxis(arr, 0, -1)
+
+
+    def _load_volume(self, pid, ct):
+        key = (pid, ct)
+        if key in self._volume_cache:
+            return self._volume_cache[key]
+
+        files = self.df[(self.df['pid'] == pid) & (self.df['ct'] == ct)]['filepath'].tolist()
+        if not files:
+            raise ValueError("No files found for pid='{}', ct='{}'".format(pid, ct))
+
+        if self.volume_mode and len(files) == 1:
+            vol = self._to_hwd(self._read_slice_file(files[0]))
+        else:
+            slices = [self._read_slice_file(x) for x in files]
+            slices = [np.squeeze(s) if np.ndim(s) == 3 and s.shape[-1] == 1 else s for s in slices]
+            for s in slices:
+                if np.ndim(s) != 2:
+                    raise ValueError("Expected 2D slice file in slice mode for pid='{}', ct='{}'".format(pid, ct))
+            vol = np.moveaxis(np.array(slices), 0, -1)
+
+        vol = vol.astype(float) * self.rescale_sl + self.rescale_in
+        self._volume_cache[key] = vol
+        return vol
 
 
     def split(self):
@@ -209,7 +289,7 @@ class MyDataLoader():
 
     def load_dicoms(self, pid, slice_nums, window=False):
         r"""
-        Load DICOM images for a specific patient and slice range.
+        Load paired image volumes (DICOM or NPY slice files) for a specific patient and slice range.
 
         :param pid: Patient ID or index.
         :param slice_nums: Tuple containing the start and end slice numbers.
@@ -223,25 +303,10 @@ class MyDataLoader():
 
         slice_num_start, slice_num_end = slice_nums
 
-        # Build the query string to retrieve DICOM filepaths within the specified slice range and patient ID
-        querystring = 'slice_num>=' + str(slice_num_start) + '&slice_num<' + str(slice_num_end) + '&pid=="' + pid + '"'
-        dA = self.df.query(querystring)[['ct', 'filepath']]
-
-        vols = []
-        # Iterate over contrast types
-        for i in range(2):
-            vol = []
-            # Retrieve DICOM filepaths for the current contrast
-            for x in dA.query('ct=="' + self.cts[i] + '"')['filepath']:
-                # Load the DICOM pixel array
-                vol.append(pydicom.dcmread(x).pixel_array)
-            # Apply rescaling to pixel values
-            vols.append(np.array(vol).astype(float) * self.rescale_sl + self.rescale_in)
-
-        # Create a 3D array for contrast type 1
-        A = np.moveaxis(np.array(vols[1]), 0, -1)
-        # Create a 3D array for contrast type 0
-        B = np.moveaxis(np.array(vols[0]), 0, -1)
+        B_full = self._load_volume(pid, self.cts[0])
+        A_full = self._load_volume(pid, self.cts[1])
+        A = A_full[:, :, slice_num_start:slice_num_end]
+        B = B_full[:, :, slice_num_start:slice_num_end]
 
         if window:
             # Apply windowing using window parameters for contrast types

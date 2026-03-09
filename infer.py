@@ -29,11 +29,11 @@ import tensorflow as tf
 # * Test data
 ########################################################################
 ### configuration
-base_dir = 'C:/Users/einspaen/AppData/Local/xnat-dataset'
-test_dir = os.path.join(base_dir, 'cnn-test')
+base_dir = r"D:\AdityaG\pix2pix\pix2pix3d-ct\rat_data"
+test_dir = r"D:\AdityaG\pix2pix\pix2pix3d-ct\rat_data\test"
 
 # load config
-spath = 'C:/Users/einspaen/AppData/Local/xnat-dataset/__Results__/Model_230907'
+spath = r"D:\AdityaG\pix2pix\models"
 
 json_files = glob.glob(os.path.join(spath, '*.json'))
 
@@ -46,6 +46,7 @@ else:
 # your own test set and names of ct folders
 cfg['df_test'] = os.path.join(test_dir, 'select.ftr')
 cfg['cts'] = ('fill', 'sub')
+cfg['data_format'] = cfg.get('data_format', 'dicom')
 cfg['splitvar'] = 1.0  # fixed
 
 # create/load test df
@@ -53,7 +54,10 @@ if os.path.exists(cfg["df_test"]):
     print("Reading feather:", cfg['df_test'])
     df_test = pd.read_feather(cfg['df_test'])
 else:
-    df_test = utils.my_dicoms_to_dataframe(test_dir, cfg["cts"])
+    if cfg.get('data_format', 'dicom').lower() == 'npy':
+        df_test = utils.my_npys_to_dataframe(test_dir, cfg["cts"])
+    else:
+        df_test = utils.my_dicoms_to_dataframe(test_dir, cfg["cts"])
 
 # sort and save df
 df_test_modify = utils.sort_and_save_dataframe(df_test, test_dir)
@@ -109,7 +113,10 @@ if os.path.exists(cfg["df_additional_test"]):
     print("Reading feather:", cfg['df_additional_test'])
     df_test = pd.read_feather(cfg['df_additional_test'])
 else:
-    df_test = utils.my_dicoms_to_dataframe(additional_test_dir, cfg["cts"])
+    if cfg.get('data_format', 'dicom').lower() == 'npy':
+        df_test = utils.my_npys_to_dataframe(additional_test_dir, cfg["cts"])
+    else:
+        df_test = utils.my_dicoms_to_dataframe(additional_test_dir, cfg["cts"])
 
 # sort and save df
 df_test_modify = utils.sort_and_save_dataframe(df_test, additional_test_dir)

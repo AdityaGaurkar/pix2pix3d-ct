@@ -10,12 +10,13 @@ Mail   :    eric.einspaenner@med.ovgu.de
 ###############################################################
 # * Configuration settings/parameters
 ###############################################################
-cts = ('fill', 'sub')
+cts = ('unhealthy', 'healthy')
+data_format = 'dicom'  # 'dicom' or 'npy'
 
 ### Img properties
 # img_shape = (256, 256, 64)
 # img_shape = (384, 384, 32)
-img_shape = (128, 128, 128)
+img_shape = (128, 128, 64)
 
 
 # grid = (128, 128, 32)

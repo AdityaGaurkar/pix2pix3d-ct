@@ -112,6 +112,86 @@ def my_dicoms_to_dataframe(basedir, cts):
     return df
 
 
+def my_npys_to_dataframe(basedir, cts):
+    r"""
+    Builds a dataframe for NPY slice datasets with folder layout:
+    basedir/<pid>/<ct>/*.npy
+    """
+    print('Start with NPYs to dataframe...')
+
+    def _sort_key(path):
+        name = os.path.splitext(os.path.basename(path))[0]
+        digits = ''.join(ch for ch in name if ch.isdigit())
+        if digits:
+            return (0, int(digits), name)
+        return (1, name)
+
+    rows = []
+    for pid in os.listdir(basedir):
+        pid_dir = os.path.join(basedir, pid)
+        if not os.path.isdir(pid_dir):
+            continue
+        for ct in cts:
+            ct_dir = os.path.join(pid_dir, ct)
+            if not os.path.isdir(ct_dir):
+                continue
+            files = sorted(glob.glob(os.path.join(ct_dir, '*.npy')), key=_sort_key)
+            if not files:
+                continue
+
+            sample = np.load(files[0], mmap_mode='r')
+            if sample.ndim == 3 and sample.shape[-1] != 1:
+                # Full-volume mode: one file per ct folder
+                if len(files) != 1:
+                    raise ValueError(
+                        "Found {} npy files in '{}'. For full-volume mode, keep exactly one volume file per ct folder.".format(
+                            len(files), ct_dir
+                        )
+                    )
+                arr = np.load(files[0], mmap_mode='r')
+                if arr.ndim != 3:
+                    raise ValueError("Expected 3D volume npy file: {}".format(files[0]))
+                rows.append({
+                    'pid': pid,
+                    'ct': ct,
+                    'zpos': 0.0,
+                    'slice_num': 0,
+                    'Depth': int(arr.shape[2]),
+                    'filepath': files[0],
+                    'Rows': int(arr.shape[0]),
+                    'Columns': int(arr.shape[1]),
+                    'RescaleIntercept': 0.0,
+                    'RescaleSlope': 1.0,
+                })
+                continue
+
+            # Slice mode: one 2D slice per file
+            for idx, f in enumerate(files):
+                arr = np.load(f, mmap_mode='r')
+                if arr.ndim == 3 and arr.shape[-1] == 1:
+                    arr = np.squeeze(arr, axis=-1)
+                if arr.ndim != 2:
+                    raise ValueError("Expected 2D npy slice file: {}".format(f))
+                rows.append({
+                    'pid': pid,
+                    'ct': ct,
+                    'zpos': float(idx),
+                    'slice_num': int(idx),
+                    'filepath': f,
+                    'Rows': int(arr.shape[0]),
+                    'Columns': int(arr.shape[1]),
+                    'RescaleIntercept': 0.0,
+                    'RescaleSlope': 1.0,
+                })
+
+    if not rows:
+        raise ValueError("No .npy files found under '{}' for CT folders {}".format(basedir, cts))
+
+    df = pd.DataFrame(rows)
+    print('Finished NPY dataframe.')
+    return df
+
+
 def sort_and_save_dataframe(df, output_directory):
     r"""
     Modifies the given DataFrame by converting 'zpos' column to numeric, sorting the DataFrame
@@ -235,8 +315,16 @@ def loop_over_case(gan, case, savedir, notruth=False):
     # fakes_int = fakes.astype('int16')
     # print("Generated image: min={}, max={}".format(np.min(fakes_int), np.max(fakes_int)))
 
+    use_npy_output = len(dcms1) > 0 and os.path.splitext(dcms1[0])[1].lower() == '.npy'
+
     for N, y in enumerate(dcms1):
         x = fakes[:, :, N]
+
+        if use_npy_output:
+            newfile = os.path.join(newpath, os.path.splitext(os.path.basename(y))[0] + '.npy')
+            np.save(newfile, x.astype(np.float32))
+            continue
+
         ds = pydicom.dcmread(y)
         ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
 
@@ -254,7 +342,7 @@ def loop_over_case(gan, case, savedir, notruth=False):
         ds.ImageType = 'DERIVED\\SECONDARY\\AXIAL\\3DANGIO\\SUB'
         ds.SeriesDescription = 'Sub Medium EE Auto Mo [SK]'
 
-        newfile = os.path.join(newpath, os.path.basename(y)) # + ".99")
+        newfile = os.path.join(newpath, os.path.basename(y))
         ds.save_as(newfile)
 
         if False:

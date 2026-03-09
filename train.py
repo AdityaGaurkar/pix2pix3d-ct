@@ -32,8 +32,8 @@ tf.test.gpu_device_name()
 # * Configuration
 ########################################################################
 ### define paths
-base_dir = 'C:/Users/einspaen/AppData/Local/xnat-dataset'
-train_dir = 'C:/Users/einspaen/AppData/Local/xnat-dataset/cnn-train'
+base_dir = r'D:\AdityaG\pix2pix\pix2pix3d-ct\rat_data'
+train_dir = r'D:\AdityaG\pix2pix\pix2pix3d-ct\rat_data\train'
 output_dir = base_dir + '/result'
 
 
@@ -50,6 +50,7 @@ else:
     cfg = {
         'df_train': os.path.join(train_dir, 'select.ftr'),
         'cts': c.cts,
+        'data_format': c.data_format,
         'img_shape': c.img_shape,
         'window1': c.window1,
         'window2': c.window2,
@@ -83,7 +84,11 @@ if os.path.exists(cfg["df_train"]):
     print("Reading feather:", cfg['df_train'])
     df_train = pd.read_feather(cfg['df_train'])
 else:
-    df_train = utils.my_dicoms_to_dataframe(train_dir, cfg["cts"])
+    data_format = cfg.get('data_format', 'dicom').lower()
+    if data_format == 'npy':
+        df_train = utils.my_npys_to_dataframe(train_dir, cfg["cts"])
+    else:
+        df_train = utils.my_dicoms_to_dataframe(train_dir, cfg["cts"])
 
 
 ### sort and save df

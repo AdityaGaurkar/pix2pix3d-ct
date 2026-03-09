@@ -14,6 +14,24 @@
 <p>To try out your own training and inference, each case in the data set should contain a pair of stack of axial CT scans in DICOM format. Please refer to <code>train.ipynb</code> and <code>inference.ipynb</code> for details.</p>
 <p>Although this project was developed for CT data, the pix2pix3D network can work for any type of input data, if <code>source/data_loader.py</code> is properly modified.</p>
 
+### NPY input support
+You can also use preprocessed `.npy` slices instead of DICOM by setting `data_format = 'npy'` in `config.py`.
+
+Expected folder layout:
+`<dataset_root>/<patient_id>/<ct_name>/*.npy`
+
+Example:
+- `.../cnn-train/001/fill/0000.npy`
+- `.../cnn-train/001/sub/0000.npy`
+
+Notes:
+- You can use either:
+- many 2D slice files per CT folder (`*.npy` with shape `(H, W)`), or
+- one full 3D volume file per CT folder (`*.npy` with shape `(H, W, D)` or `(D, H, W)`).
+- In full-volume mode, keep exactly one `.npy` file in each `<patient>/<ct_name>/` folder.
+- `ct_name` folders must match `cts` in `config.py` (default: `('fill', 'sub')`).
+- During inference with `.npy` input, generated outputs are saved as `.npy` files.
+
 ## Description
 This model is built using the Keras library. The provided code includes definitions for the generator, discriminator, and the complete training procedure for the pix2pix model. The model takes two types of images as input: `imgs_A` (original images) and `imgs_B` (conditioning images), and generates fake images as output.
 

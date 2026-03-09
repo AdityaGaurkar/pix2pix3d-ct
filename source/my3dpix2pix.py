@@ -25,7 +25,7 @@ from keras.layers import BatchNormalization, Activation, GaussianNoise
 from keras.layers import LeakyReLU
 from keras.layers import UpSampling3D, Conv3D
 from keras.models import Model
-from keras.optimizers import adam_v2
+from keras.optimizers import Adam
 from keras import losses
 # from keras.utils import multi_gpu_model
 from keras_contrib.layers.normalization.instancenormalization import InstanceNormalization
