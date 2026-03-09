@@ -13,6 +13,8 @@ Mail   :    eric.einspaenner@med.ovgu.de
 ########################################################################
 import json
 import os
+import re
+import datetime
 import pandas as pd
 import numpy as np
 import matplotlib
@@ -27,13 +29,52 @@ import config as c
 import tensorflow as tf
 tf.test.gpu_device_name()
 
+try:
+    import mlflow
+except Exception:
+    mlflow = None
+
+
+def normalize_cfg_paths(cfg, train_dir, output_dir):
+    """Resolve legacy absolute paths from older configs across OSes."""
+    df_train = cfg.get('df_train')
+    if isinstance(df_train, str):
+        df_train = df_train.replace('\\', os.sep)
+        fallback_df = os.path.join(train_dir, 'select.ftr')
+        if os.path.exists(df_train):
+            cfg['df_train'] = df_train
+        elif os.path.exists(fallback_df):
+            print("Resolved missing df_train path to:", fallback_df)
+            cfg['df_train'] = fallback_df
+
+    splitvar = cfg.get('splitvar')
+    if isinstance(splitvar, str):
+        splitvar = splitvar.replace('\\', os.sep)
+        fallback_split = os.path.join(output_dir, 'split.pkl')
+        if os.path.exists(splitvar):
+            cfg['splitvar'] = splitvar
+        elif os.path.exists(fallback_split):
+            print("Resolved missing splitvar path to:", fallback_split)
+            cfg['splitvar'] = fallback_split
+        else:
+            print("Configured split file missing. Falling back to random split:", c.splitvar)
+            cfg['splitvar'] = c.splitvar
+
+
+def _mlflow_param_value(v):
+    if isinstance(v, (str, int, float, bool)):
+        return v
+    if v is None:
+        return "None"
+    return json.dumps(v)
+
 
 ########################################################################
 # * Configuration
 ########################################################################
 ### define paths
-base_dir = r'D:\AdityaG\pix2pix\pix2pix3d-ct\rat_data'
-train_dir = r'D:\AdityaG\pix2pix\pix2pix3d-ct\rat_data\train'
+base_dir = r'/home/cet/pix2pix/pix2pix3d-ct/rat_data'
+train_dir = r'/home/cet/pix2pix/pix2pix3d-ct/rat_data/train'
 output_dir = base_dir + '/result'
 
 
@@ -44,6 +85,7 @@ if os.path.exists(cfg_path):
     print("Loading existing config: {}".format(cfg_path))
     with open(cfg_path) as json_file:
         cfg = json.load(json_file)
+    normalize_cfg_paths(cfg, train_dir, output_dir)
 else:
     print("Creating new config:", cfg_path)
     ## new config
@@ -108,6 +150,10 @@ DL = MyDataLoader(df_train_modify, cts=cfg['cts'], img_shape=cfg['img_shape'],
 if not os.path.isdir(output_dir):
     os.makedirs(output_dir)
 
+debug_input_dir = os.path.join(output_dir, 'debug_input')
+DL.dump_preprocessed_sample(debug_input_dir, split=0, sample_index=0)
+print("Saved preprocessed debug tensors to:", debug_input_dir)
+
 split_path = os.path.join(output_dir, 'split.pkl')
 DL.save_split(split_path)
 cfg['splitvar'] = split_path
@@ -132,7 +178,8 @@ if not os.path.isdir(models_dir):
 if os.path.exists(models_dir):
     epoch = gan.load_final_weights()
     if epoch:
-        epoch = int(epoch)
+        m = re.search(r'(\d+)$', str(epoch))
+        epoch = int(m.group(1)) if m else 0
     else:
         epoch = 0
 else:
@@ -143,10 +190,53 @@ else:
 ########################################################################
 # * Train
 ########################################################################
-gan.train(epochs=cfg['epochs'], batch_size=cfg['batch_size'], sample_interval=cfg['sample_interval'], model_interval=cfg['model_interval'], epoch_start=epoch)
+mlflow_active = mlflow is not None
+if mlflow_active:
+    tracking_dir = os.path.join(output_dir, "mlruns")
+    os.makedirs(tracking_dir, exist_ok=True)
+    mlflow.set_tracking_uri("file://" + os.path.abspath(tracking_dir))
+    mlflow.set_experiment("pix2pix3d-ct")
+    run_name = datetime.datetime.now().strftime("train-%Y%m%d-%H%M%S")
+    mlflow.start_run(run_name=run_name)
+    mlflow.set_tags({
+        "project": "pix2pix3d-ct",
+        "stage": "train",
+        "data_format": str(cfg.get("data_format", "unknown")),
+    })
+    mlflow.log_params({k: _mlflow_param_value(v) for k, v in cfg.items()})
+    mlflow.log_param("epoch_start", int(epoch))
+    mlflow.log_param("train_cases", int(len(DL.case_split[0])))
+    mlflow.log_param("val_cases", int(len(DL.case_split[1])))
+else:
+    print("MLflow not installed; proceeding without experiment tracking.")
 
+def _metric_logger(metrics_dict, step):
+    if mlflow_active:
+        mlflow.log_metrics(metrics_dict, step=int(step))
 
-########################################################################
-# * Plot
-########################################################################
-utils.plot_tracking_gan(output_dir)
+run_status = "FINISHED"
+try:
+    gan.train(epochs=cfg['epochs'], batch_size=cfg['batch_size'], sample_interval=cfg['sample_interval'],
+              model_interval=cfg['model_interval'], epoch_start=epoch, metric_logger=_metric_logger)
+    ########################################################################
+    # * Plot
+    ########################################################################
+    utils.plot_tracking_gan(output_dir)
+except Exception:
+    run_status = "FAILED"
+    raise
+finally:
+    if mlflow_active:
+        artifacts = [
+            os.path.join(output_dir, c.get_cfg_filename(c.img_shape, c.grid)),
+            os.path.join(output_dir, "log.txt"),
+            os.path.join(output_dir, "loss.png"),
+            split_path,
+        ]
+        for artifact_path in artifacts:
+            if os.path.exists(artifact_path):
+                mlflow.log_artifact(artifact_path)
+        debug_dir = os.path.join(output_dir, "debug_input")
+        if os.path.isdir(debug_dir):
+            mlflow.log_artifacts(debug_dir, artifact_path="debug_input")
+        mlflow.end_run(status=run_status)

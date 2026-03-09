@@ -23,6 +23,7 @@ dependencies:
     - scikit-image
     - pypng
     - numpy
+    - mlflow
     - pydot
     - pynetdicom==1.5
 #    - xnat==1.5

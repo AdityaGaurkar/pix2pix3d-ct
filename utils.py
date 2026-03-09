@@ -119,6 +119,19 @@ def my_npys_to_dataframe(basedir, cts):
     """
     print('Start with NPYs to dataframe...')
 
+    def _volume_hwd_shape(arr, path):
+        if arr.ndim != 3:
+            raise ValueError("Expected 3D volume npy file: {}".format(path))
+        # H, W, D
+        if arr.shape[0] >= arr.shape[2] and arr.shape[1] >= arr.shape[2]:
+            return int(arr.shape[0]), int(arr.shape[1]), int(arr.shape[2])
+        # D, H, W
+        if arr.shape[1] >= arr.shape[0] and arr.shape[2] >= arr.shape[0]:
+            return int(arr.shape[1]), int(arr.shape[2]), int(arr.shape[0])
+        raise ValueError(
+            "Ambiguous 3D npy volume shape {} for '{}'. Expected HxWxD or DxHxW.".format(arr.shape, path)
+        )
+
     def _sort_key(path):
         name = os.path.splitext(os.path.basename(path))[0]
         digits = ''.join(ch for ch in name if ch.isdigit())
@@ -149,17 +162,16 @@ def my_npys_to_dataframe(basedir, cts):
                         )
                     )
                 arr = np.load(files[0], mmap_mode='r')
-                if arr.ndim != 3:
-                    raise ValueError("Expected 3D volume npy file: {}".format(files[0]))
+                nrows, ncols, depth = _volume_hwd_shape(arr, files[0])
                 rows.append({
                     'pid': pid,
                     'ct': ct,
                     'zpos': 0.0,
                     'slice_num': 0,
-                    'Depth': int(arr.shape[2]),
+                    'Depth': depth,
                     'filepath': files[0],
-                    'Rows': int(arr.shape[0]),
-                    'Columns': int(arr.shape[1]),
+                    'Rows': nrows,
+                    'Columns': ncols,
                     'RescaleIntercept': 0.0,
                     'RescaleSlope': 1.0,
                 })
@@ -251,21 +263,13 @@ def loop_over_case(gan, case, savedir, notruth=False):
     # check/compare the image size to GAN size and skip datasets with smaller images sizes
     if img_size[0] < gan_size[0] or img_size[1] < gan_size[1] or img_size[2] < gan_size[2]:
         print("Skipping {} due to image size smaller than GAN size.".format(pid))
-        return  # Skip the rest of the function
+        return None  # Skip the rest of the function
 
-    a = []
-    b = []
-    for w in gan.data_loader.window2:
-        a.append(WND(dcm_A, w))
-    for w in gan.data_loader.window1:
-        b.append(WND(dcm_B, w))
-    tot_A = np.stack(a, axis=-1)
-    tot_B = np.stack(b, axis=-1)
-    tot_A = tot_A.astype('float32') / 127.5 - 1.
-    tot_B = tot_B.astype('float32') / 127.5 - 1.
+    tot_A = gan.data_loader.prepare_volume_for_model(dcm_A, domain='A')
+    tot_B = gan.data_loader.prepare_volume_for_model(dcm_B, domain='B')
 
     fakes_raw = np.full((img_size[0], img_size[1], img_size[2]), 0, dtype=tot_B.dtype)
-    # counts_raw = np.full((img_size[0], img_size[1], img_size[2]), 0, dtype=int)
+    counts_raw = np.full((img_size[0], img_size[1], img_size[2]), 0, dtype=np.float32)
 
     # for zi in range()
     for xi in range(int(math.ceil(img_size[0] / gan_size[0]))):
@@ -278,18 +282,15 @@ def loop_over_case(gan, case, savedir, notruth=False):
             for zi in range(int(math.ceil(img_size[2] / gan_size[2]))):
                 z = min(zi * gan_size[2], img_size[2] - gan_size[2])
                 imgs_B = np.expand_dims(tot_B[x:x+gan_size[0], y:y+gan_size[1], z:z+gan_size[2], :], axis=0)
-                fake_A = gan.generator.predict(imgs_B)
-                fake_A = 0.5 * fake_A + 0.5
-                # fake_A = 255. * fake_A[:, :, :, :, 0]
-                fake_A = rWND(255. * fake_A[:, :, :, :, 0], gan.data_loader.window2[0])
+                fake_A = gan.generator.predict(imgs_B, verbose=0)
+                fake_A = gan.data_loader.postprocess_generated(fake_A)
                 # print(xi, yi, zi, np.min(fake_A), np.max(fake_A), np.mean(fake_A), np.median(fake_A), np.std(fake_A))
-                fakes_raw[x:x+gan_size[0], y:y+gan_size[1], z:z+gan_size[2]] = fake_A[0]
-                # counts_raw[x:x+gan_size[0], y:y+gan_size[1], zi:zi+gan_size[2]] += 1
+                fakes_raw[x:x+gan_size[0], y:y+gan_size[1], z:z+gan_size[2]] += fake_A
+                counts_raw[x:x+gan_size[0], y:y+gan_size[1], z:z+gan_size[2]] += 1.0
 
-    # mcounts = counts_raw.copy()
-    # mcounts[mcounts == 0] = 1
-    # fakes = np.divide(fakes_raw, mcounts)
-    fakes = fakes_raw
+    mcounts = counts_raw.copy()
+    mcounts[mcounts == 0] = 1.0
+    fakes = np.divide(fakes_raw, mcounts)
     # print(np.min(fakes), np.max(fakes), np.mean(fakes), np.median(fakes), np.std(fakes))
 
     # # random sample
@@ -317,33 +318,39 @@ def loop_over_case(gan, case, savedir, notruth=False):
 
     use_npy_output = len(dcms1) > 0 and os.path.splitext(dcms1[0])[1].lower() == '.npy'
 
-    for N, y in enumerate(dcms1):
-        x = fakes[:, :, N]
+    # Full-volume npy mode: keep one 3D output volume for downstream STL conversion.
+    if use_npy_output and len(dcms1) == 1:
+        y = dcms1[0]
+        newfile = os.path.join(newpath, os.path.splitext(os.path.basename(y))[0] + '.npy')
+        np.save(newfile, fakes.astype(np.float32))
+    else:
+        for N, y in enumerate(dcms1):
+            x = fakes[:, :, N]
 
-        if use_npy_output:
-            newfile = os.path.join(newpath, os.path.splitext(os.path.basename(y))[0] + '.npy')
-            np.save(newfile, x.astype(np.float32))
-            continue
+            if use_npy_output:
+                newfile = os.path.join(newpath, os.path.splitext(os.path.basename(y))[0] + '.npy')
+                np.save(newfile, x.astype(np.float32))
+                continue
 
-        ds = pydicom.dcmread(y)
-        ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+            ds = pydicom.dcmread(y)
+            ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
 
-        x = (x - float(ds.RescaleIntercept)) / float(ds.RescaleSlope)
+            x = (x - float(ds.RescaleIntercept)) / float(ds.RescaleSlope)
 
-        x = x.astype('uint16')
-        x_bytes = x.tobytes()
-        ds.PixelData = x_bytes
-        ds['PixelData'].is_undefined_length = False
+            x = x.astype('uint16')
+            x_bytes = x.tobytes()
+            ds.PixelData = x_bytes
+            ds['PixelData'].is_undefined_length = False
 
-        ds.SeriesNumber += 99000
-        ds.SeriesInstanceUID += '.99'
-        ds.SOPInstanceUID += '.99'
+            ds.SeriesNumber += 99000
+            ds.SeriesInstanceUID += '.99'
+            ds.SOPInstanceUID += '.99'
 
-        ds.ImageType = 'DERIVED\\SECONDARY\\AXIAL\\3DANGIO\\SUB'
-        ds.SeriesDescription = 'Sub Medium EE Auto Mo [SK]'
+            ds.ImageType = 'DERIVED\\SECONDARY\\AXIAL\\3DANGIO\\SUB'
+            ds.SeriesDescription = 'Sub Medium EE Auto Mo [SK]'
 
-        newfile = os.path.join(newpath, os.path.basename(y))
-        ds.save_as(newfile)
+            newfile = os.path.join(newpath, os.path.basename(y))
+            ds.save_as(newfile)
 
         if False:
             with open(newfile + '.png', 'wb') as f:
@@ -353,36 +360,43 @@ def loop_over_case(gan, case, savedir, notruth=False):
                 writer.write(f, zgray2list)
 
     if True:
-        w_min = (gan.data_loader.window2[0][1] - gan.data_loader.window2[0][0] / 2)
-        w_max = (gan.data_loader.window2[0][1] + gan.data_loader.window2[0][0] / 2)
-        
         img_original = dcm_A.astype(dtype=float)
-        
-        print("Window: min={}; max={}".format(w_min, w_max))
-        
         img_generated = np.copy(fakes).astype(dtype=float)
-        
-        img_generated[img_generated > w_max] = w_max
-        img_generated[img_generated < w_min] = w_min
-        
-        #img_generated[img_generated > -100000] = 0
-        
-        img_original[img_original > w_max] = w_max
-        img_original[img_original < w_min] = w_min
+
+        if gan.data_loader.is_npy_dataset and gan.data_loader.npy_is_normalized_01:
+            w_min = 0.0
+            w_max = 1.0
+            data_range = 1.0
+            img_original = np.clip(img_original, w_min, w_max)
+            img_generated = np.clip(img_generated, w_min, w_max)
+        else:
+            w_min = (gan.data_loader.window2[0][1] - gan.data_loader.window2[0][0] / 2)
+            w_max = (gan.data_loader.window2[0][1] + gan.data_loader.window2[0][0] / 2)
+            data_range = int(math.ceil(w_max - w_min))
+            img_generated[img_generated > w_max] = w_max
+            img_generated[img_generated < w_min] = w_min
+            img_original[img_original > w_max] = w_max
+            img_original[img_original < w_min] = w_min
+
+        print("Window: min={}; max={}".format(w_min, w_max))
         
         print(img_original.shape, img_generated.shape)
         
         print(np.min(img_original), np.max(img_original), np.mean(img_original), np.std(img_original))
         print(np.min(img_generated), np.max(img_generated), np.mean(img_generated), np.std(img_generated))
         
-        psnr = metrics.peak_signal_noise_ratio(img_original, img_generated, data_range=int(math.ceil(w_max-w_min)))
+        psnr = metrics.peak_signal_noise_ratio(img_original, img_generated, data_range=data_range)
         #print("PSNR: {}".format(psnr))
         
-        mssim, S = metrics.structural_similarity(img_original, img_generated, data_range=int(math.ceil(w_max-w_min)), full=True, gaussian_weights=True)
+        mssim, S = metrics.structural_similarity(
+            img_original, img_generated, data_range=data_range, full=True, gaussian_weights=True
+        )
         #print("SSIM: {}".format(mssim))
         #print(S.shape)
         
-        nmse = np.mean((img_original - img_generated) ** 2, dtype=np.float64) / np.mean((img_original) ** 2, dtype=np.float64)
+        nmse = np.mean((img_original - img_generated) ** 2, dtype=np.float64) / (
+            np.mean((img_original) ** 2, dtype=np.float64) + 1e-8
+        )
         #print("NMSE: {}".format(nmse))
 
         newlog = "[PID: %s] [PSNR: %f] [SSIM: %f] [NMSE: %f]" % (pid, psnr, mssim, nmse)
@@ -390,8 +404,14 @@ def loop_over_case(gan, case, savedir, notruth=False):
         print(newlog)
         with open(os.path.join(savedir, 'log.txt'), 'a') as f:
             f.write(newlog + '\n')
-    
-    return
+        return {
+            'pid': pid,
+            'psnr': float(psnr),
+            'ssim': float(mssim),
+            'nmse': float(nmse),
+        }
+
+    return None
 
 
 def plot_tracking_gan(input_dir):

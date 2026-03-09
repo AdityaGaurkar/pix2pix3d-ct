@@ -11,7 +11,7 @@ Mail   :    eric.einspaenner@med.ovgu.de
 # * Configuration settings/parameters
 ###############################################################
 cts = ('unhealthy', 'healthy')
-data_format = 'dicom'  # 'dicom' or 'npy'
+data_format = 'npy'  # 'dicom' or 'npy'
 
 ### Img properties
 # img_shape = (256, 256, 64)
@@ -33,7 +33,7 @@ window2 = [(8000, 3000)]
 
 
 batch_size = 3
-epochs = 10
+epochs = 100
 
 
 optimizer = 'adam'

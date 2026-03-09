@@ -16,6 +16,7 @@ import numbers
 import numpy as np
 import os
 import pickle
+import pandas as pd
 import pydicom
 from skimage import exposure
 import threading
@@ -116,19 +117,49 @@ class MyDataLoader():
             return x
 
         # Preprocesses the input DataFrame and initializes class attributes
-        self.df = df.reset_index(drop=True)
-        self.df = self.df.groupby(['pid', 'ct'])
-        self.df = self.df.apply(slice_count)
-        self.df = self.df.reset_index(drop=True)
-        self.df = self.df.sort_values(by=['pid', 'ct', 'slice_num'])
-        self.df = self.df.reset_index(drop=True)
+        self.df = df.reset_index(drop=True).copy()
+        if 'pid' not in self.df.columns or 'ct' not in self.df.columns:
+            raise ValueError("Input dataframe must contain 'pid' and 'ct' columns.")
+
+        if 'slice_num' in self.df.columns:
+            self.df['slice_num'] = self.df['slice_num'].astype(int)
+            g = self.df.groupby(['pid', 'ct'])['slice_num']
+            m = g.transform('min')
+            M = g.transform('max')
+            denom = (M - m).replace(0, 1)
+            self.df['slice_pos'] = (self.df['slice_num'] - m) / denom
+        else:
+            if 'zpos' in self.df.columns:
+                xx = pd.to_numeric(self.df['zpos'])
+            elif 'ImagePosition(Patient)' in self.df.columns:
+                xx = self.df['ImagePosition(Patient)'].apply(
+                    lambda v: [str(n).strip() for n in ast.literal_eval(v)][-1]
+                ).astype(float)
+            else:
+                raise ValueError("DataFrame must contain either 'slice_num', 'zpos', or 'ImagePosition(Patient)'")
+
+            self.df['_xx'] = xx
+            g = self.df.groupby(['pid', 'ct'])['_xx']
+            self.df['slice_num'] = g.rank(method='min', ascending=False).astype(int) - 1
+            m = g.transform('min')
+            M = g.transform('max')
+            denom = (M - m).replace(0, 1)
+            self.df['slice_pos'] = (M - self.df['_xx']) / denom
+            del self.df['_xx']
+
+        self.df = self.df.sort_values(by=['pid', 'ct', 'slice_num']).reset_index(drop=True)
         first_row = self.df.iloc[0]
         tpid = first_row['pid']
         tfilepath = first_row['filepath']
+        self.data_ext = os.path.splitext(tfilepath)[1].lower()
+        self.is_npy_dataset = self.data_ext == '.npy'
         self.rescale_in = float(first_row.get('RescaleIntercept', 0.0))
         self.rescale_sl = float(first_row.get('RescaleSlope', 1.0))
         first_arr = self._read_slice_file(tfilepath)
         first_hwd = self._to_hwd(first_arr)
+        first_min = float(np.nanmin(first_hwd))
+        first_max = float(np.nanmax(first_hwd))
+        self.npy_is_normalized_01 = self.is_npy_dataset and (-1e-6 <= first_min) and (first_max <= 1.000001)
         self.rows = int(first_hwd.shape[0])
         self.cols = int(first_hwd.shape[1])
         self.volume_mode = 'Depth' in self.df.columns or first_hwd.shape[2] > 1 and \
@@ -171,12 +202,17 @@ class MyDataLoader():
         if arr.ndim != 3:
             raise ValueError("Expected 2D or 3D array, got shape {}".format(arr.shape))
 
-        # Already H, W, D
+        # H, W, D
         if arr.shape[0] >= arr.shape[2] and arr.shape[1] >= arr.shape[2]:
             return arr
 
         # D, H, W -> H, W, D
-        return np.moveaxis(arr, 0, -1)
+        if arr.shape[1] >= arr.shape[0] and arr.shape[2] >= arr.shape[0]:
+            return np.moveaxis(arr, 0, -1)
+
+        raise ValueError(
+            "Ambiguous 3D volume shape {}. Expected HxWxD or DxHxW ordering.".format(arr.shape)
+        )
 
 
     def _load_volume(self, pid, ct):
@@ -201,6 +237,53 @@ class MyDataLoader():
         vol = vol.astype(float) * self.rescale_sl + self.rescale_in
         self._volume_cache[key] = vol
         return vol
+
+    @staticmethod
+    def _repeat_channels(vol, channels):
+        if channels <= 1:
+            return np.expand_dims(vol, axis=-1)
+        return np.repeat(np.expand_dims(vol, axis=-1), repeats=channels, axis=-1)
+
+
+    def _normalize_for_model(self, img):
+        if self.rescale_intensity:
+            return exposure.rescale_intensity(img, out_range=(-0.95, 0.95))
+        if self.is_npy_dataset and self.npy_is_normalized_01:
+            return img * 2.0 - 1.0
+        return img / 127.5 - 1.0
+
+
+    def prepare_volume_for_model(self, vol, domain):
+        """
+        Convert a 3D volume to model input tensor (H, W, D, C) with matching normalization.
+        domain: 'A' (target) uses window2 length; 'B' (input) uses window1 length.
+        """
+        if domain == 'A':
+            windows = self.window2
+        elif domain == 'B':
+            windows = self.window1
+        else:
+            raise ValueError("domain must be 'A' or 'B'")
+
+        if self.is_npy_dataset:
+            stacked = self._repeat_channels(vol, len(windows))
+        else:
+            stacked = np.stack([WND(vol, w) for w in windows], axis=-1)
+
+        return self._normalize_for_model(stacked).astype(np.float32)
+
+
+    def postprocess_generated(self, fake_batch):
+        """
+        Convert generator output batch (1, H, W, D, C) back to 3D intensity volume.
+        """
+        fake = fake_batch[0]
+        ch0 = fake[:, :, :, 0]
+        if self.is_npy_dataset:
+            if self.npy_is_normalized_01:
+                return np.clip(0.5 * (ch0 + 1.0), 0.0, 1.0)
+            return 127.5 * (ch0 + 1.0)
+        return rWND(255.0 * (0.5 * ch0 + 0.5), self.window2[0])
 
 
     def split(self):
@@ -308,7 +391,7 @@ class MyDataLoader():
         A = A_full[:, :, slice_num_start:slice_num_end]
         B = B_full[:, :, slice_num_start:slice_num_end]
 
-        if window:
+        if window and not self.is_npy_dataset:
             # Apply windowing using window parameters for contrast types
             A = WND(A, self.window2[0])
             B = WND(B, self.window1[0])
@@ -345,16 +428,20 @@ class MyDataLoader():
         B = B[ym:yM, xm:xM, :]
 
         if window:
-            a = []
-            b = []
-            for w in self.window2:
-                # Apply windowing using window parameters for contrast type 1
-                a.append(WND(A, w))
-            for w in self.window1:
-                # Apply windowing using window parameters for contrast type 0
-                b.append(WND(B, w))
-            A = np.stack(a, axis=-1)
-            B = np.stack(b, axis=-1)
+            if self.is_npy_dataset:
+                A = self._repeat_channels(A, len(self.window2))
+                B = self._repeat_channels(B, len(self.window1))
+            else:
+                a = []
+                b = []
+                for w in self.window2:
+                    # Apply windowing using window parameters for contrast type 1
+                    a.append(WND(A, w))
+                for w in self.window1:
+                    # Apply windowing using window parameters for contrast type 0
+                    b.append(WND(B, w))
+                A = np.stack(a, axis=-1)
+                B = np.stack(b, axis=-1)
 
         # Return preprocessed images as a tuple of 3D arrays
         return A, B
@@ -388,14 +475,18 @@ class MyDataLoader():
         B = B[ym:yM, xm:xM, :]
 
         if window:
-            a = []
-            b = []
-            for w in self.window2:
-                a.append(WND(A, w))
-            for w in self.window1:
-                b.append(WND(B, w))
-            A = np.stack(a, axis=-1)
-            B = np.stack(b, axis=-1)
+            if self.is_npy_dataset:
+                A = self._repeat_channels(A, len(self.window2))
+                B = self._repeat_channels(B, len(self.window1))
+            else:
+                a = []
+                b = []
+                for w in self.window2:
+                    a.append(WND(A, w))
+                for w in self.window1:
+                    b.append(WND(B, w))
+                A = np.stack(a, axis=-1)
+                B = np.stack(b, axis=-1)
 
         return A, B
 
@@ -446,12 +537,8 @@ class MyDataLoader():
                         pos = total_samples[p][1:]
 
                         img_A, img_B = self.data_loader.imread(c, pos)
-                        if self.data_loader.rescale_intensity:
-                            img_A = exposure.rescale_intensity(img_A, out_range=(-0.95, 0.95))
-                            img_B = exposure.rescale_intensity(img_B, out_range=(-0.95, 0.95))
-                        else:
-                            img_A = img_A / 127.5 - 1.
-                            img_B = img_B / 127.5 - 1.
+                        img_A = self.data_loader._normalize_for_model(img_A)
+                        img_B = self.data_loader._normalize_for_model(img_B)
                         imgs_A.append(img_A)
                         imgs_B.append(img_B)
 
@@ -491,7 +578,36 @@ class MyDataLoader():
             imgs_A.append(img_A)
             imgs_B.append(img_B)
 
-        imgs_A = np.array(imgs_A) / 127.5 - 1.
-        imgs_B = np.array(imgs_B) / 127.5 - 1.
+        imgs_A = self._normalize_for_model(np.array(imgs_A))
+        imgs_B = self._normalize_for_model(np.array(imgs_B))
 
         return imgs_A, imgs_B
+
+
+    def dump_preprocessed_sample(self, save_dir, split=0, sample_index=0):
+        r"""
+        Save one training sample exactly as it is produced by DataLoader preprocessing.
+
+        Files written:
+        - raw_windowed_A.npy / raw_windowed_B.npy  (after windowing, before normalization)
+        - preprocessed_A.npy / preprocessed_B.npy  (final values fed into model input pipeline)
+        """
+        os.makedirs(save_dir, exist_ok=True)
+
+        total_samples = self.total_samples[split]
+        if len(total_samples) == 0:
+            raise ValueError("No samples available for split {}.".format(split))
+
+        i = int(sample_index) % len(total_samples)
+        c = total_samples[i][0]
+        pos = total_samples[i][1:]
+        img_A, img_B = self.imread(c, pos, split=split)
+
+        np.save(os.path.join(save_dir, 'raw_windowed_A.npy'), img_A.astype(np.float32))
+        np.save(os.path.join(save_dir, 'raw_windowed_B.npy'), img_B.astype(np.float32))
+
+        img_A_in = self._normalize_for_model(img_A)
+        img_B_in = self._normalize_for_model(img_B)
+
+        np.save(os.path.join(save_dir, 'preprocessed_A.npy'), img_A_in.astype(np.float32))
+        np.save(os.path.join(save_dir, 'preprocessed_B.npy'), img_B_in.astype(np.float32))

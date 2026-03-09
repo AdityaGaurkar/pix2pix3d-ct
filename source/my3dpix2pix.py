@@ -33,6 +33,16 @@ from keras_contrib.layers.normalization.instancenormalization import InstanceNor
 import matplotlib
 matplotlib.use('Agg')
 
+# Compatibility shim: keras_contrib expects K.int_shape in older Keras APIs.
+if not hasattr(K, 'int_shape'):
+    K.int_shape = tf.keras.backend.int_shape
+if not hasattr(K, 'mean'):
+    K.mean = tf.keras.backend.mean
+if not hasattr(K, 'std'):
+    K.std = tf.keras.backend.std
+if not hasattr(K, 'reshape'):
+    K.reshape = tf.keras.backend.reshape
+
 # def rWND(img, window: tuple):
 #     min = tuple[1]
 #     max = tuple[0]
@@ -121,23 +131,11 @@ class My3dResize(Layer):
         return tuple(output_shape)
 
     def call(self, inputs):
-        input_shape = inputs.get_shape().as_list()
-        output_shape = input_shape.copy()
-        output_shape[1] = output_shape[1] * self.sizes[0]
-        output_shape[2] = output_shape[2] * self.sizes[1]
-        output_shape[3] = output_shape[3] * self.sizes[2]
-
-        # resize rows and columns
-        u = tf.reshape(inputs, shape=[-1] + input_shape[1:-2] + [input_shape[-2] * input_shape[-1]])
-        if self.nn:
-            u = tf.image.resize(u, size=output_shape[1:3], method=tf.image.ResizeMethod.BILINEAR)
-        else:
-            u = tf.image.resize(u, size=output_shape[1:3], method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
-        u = tf.reshape(u, shape=[-1] + output_shape[1:-2] + input_shape[-2:])
-
-        # repeat depth-wise
-        outputs = K.repeat_elements(u, self.sizes[2], axis=3)
-
+        # XLA-safe integer upsampling by axis repetition.
+        outputs = inputs
+        outputs = tf.repeat(outputs, repeats=self.sizes[0], axis=1)
+        outputs = tf.repeat(outputs, repeats=self.sizes[1], axis=2)
+        outputs = tf.repeat(outputs, repeats=self.sizes[2], axis=3)
         return outputs
 
 
@@ -184,19 +182,25 @@ class My3dPix2Pix():
         self.gf = 64
         self.df = 64
 
-        # Define optimizer
-        optimizer = adam_v2.Adam(0.0002, 0.5)
-        if self.opt == 'adam':
-            optimizer = adam_v2.Adam(self.lr_ini, 0.5)
-        print('Optimizer: ', optimizer)
+        # Define optimizers (do not share instances across models in Keras 3).
+        def make_optimizer():
+            if self.opt == 'adam':
+                return Adam(self.lr_ini, 0.5)
+            return Adam(0.0002, 0.5)
+
+        d_optimizer = make_optimizer()
+        df_optimizer = make_optimizer()
+        g_optimizer = make_optimizer()
+        print('D optimizer: ', d_optimizer)
+        print('G optimizer: ', g_optimizer)
 
         # Build and compile the discriminator
         self.discriminator, self.discriminator_feat = self.build_discriminator()
         self.discriminator.compile(loss='binary_crossentropy',
-                                   optimizer=optimizer, loss_weights=[0.5],
-                                   metrics=['accuracy'])
+                                   optimizer=d_optimizer, loss_weights=[0.5],
+                                   metrics=['accuracy'], jit_compile=False)
         self.discriminator_feat.compile(loss='mae',
-                                        optimizer=optimizer)
+                                        optimizer=df_optimizer, jit_compile=False)
 
         # -------------------------
         # Construct Computational
@@ -234,24 +238,29 @@ class My3dPix2Pix():
             '''
             valid = self.discriminator([fake_A, img_B])
 
-            self.combined = Model(inputs=[img_A, img_B], outputs=[valid, fake_A])
+            self.combined = Model(inputs=img_B, outputs=[valid, fake_A])
             # if multigpu is not None:
             #     self.combined = multi_gpu_model(self.combined, gpus=multigpu)
 
             self.combined.compile(loss=['binary_crossentropy', ssim_mae_loss],
                                   loss_weights=list(L_weights),
-                                  optimizer=optimizer)
+                                  optimizer=g_optimizer, jit_compile=False)
 
         else:
             valid = self.discriminator([fake_A, img_B])
 
-            self.combined = Model(inputs=[img_A, img_B], outputs=[valid, fake_A])
+            self.combined = Model(inputs=img_B, outputs=[valid, fake_A])
             # if multigpu is not None:
             #     self.combined = multi_gpu_model(self.combined, gpus=multigpu)
 
             self.combined.compile(loss=['binary_crossentropy', 'mae'],
                                   loss_weights=list(L_weights),
-                                  optimizer=optimizer)
+                                  optimizer=g_optimizer, jit_compile=False)
+
+        # Keep D/F models trainable for their own train_on_batch calls.
+        # Combined was already compiled with D frozen.
+        self.discriminator.trainable = True
+        self.discriminator_feat.trainable = True
 
         # tf.keras.utils.plot_model(self.combined, to_file="model.png",
         #                           show_shapes=True,
@@ -273,7 +282,7 @@ class My3dPix2Pix():
             init = RandomNormal(stddev=0.02)
             d = Conv3D(filters, kernel_size=kernel_size, strides=strides, padding='same', kernel_initializer=init)(
                 layer_input)
-            d = LeakyReLU(alpha=0.2)(d)
+            d = LeakyReLU(negative_slope=0.2)(d)
             if bn:
                 # d = BatchNormalization(momentum=0.8)(d)
                 d = InstanceNormalization()(d)
@@ -354,7 +363,7 @@ class My3dPix2Pix():
             init = RandomNormal(stddev=0.02)
             d = Conv3D(filters, kernel_size=kernel_size, strides=strides, padding='same', kernel_initializer=init)(
                 layer_input)
-            d = LeakyReLU(alpha=0.2)(d)
+            d = LeakyReLU(negative_slope=0.2)(d)
             if bn:
                 # d = BatchNormalization(momentum=0.8)(d)
                 d = InstanceNormalization()(d)
@@ -474,8 +483,30 @@ class My3dPix2Pix():
 
         return imgs_A, imgs_B
 
+    @staticmethod
+    def _set_optimizer_lr(optimizer, lr):
+        """Set optimizer learning rate across Keras/TensorFlow API variants."""
+        if optimizer is None:
+            return
 
-    def train(self, epochs, batch_size=1, sample_interval=200, model_interval=-1, epoch_start: int = 0):
+        if hasattr(optimizer, 'learning_rate'):
+            lr_attr = optimizer.learning_rate
+            if hasattr(lr_attr, 'assign'):
+                lr_attr.assign(lr)
+            else:
+                optimizer.learning_rate = lr
+            return
+
+        if hasattr(optimizer, 'lr'):
+            lr_attr = optimizer.lr
+            if hasattr(lr_attr, 'assign'):
+                lr_attr.assign(lr)
+            else:
+                optimizer.lr = lr
+
+
+    def train(self, epochs, batch_size=1, sample_interval=200, model_interval=-1, epoch_start: int = 0,
+              metric_logger=None):
 
         start_time = datetime.datetime.now()
 
@@ -497,8 +528,8 @@ class My3dPix2Pix():
                 lr = self.lr_ini
             else:
                 lr = self.lr_ini / (1 + (epoch - 10) * self.lr_decay)
-            K.set_value(self.discriminator.optimizer.lr, lr)
-            K.set_value(self.combined.optimizer.lr, lr)
+            self._set_optimizer_lr(self.discriminator.optimizer, lr)
+            self._set_optimizer_lr(self.combined.optimizer, lr)
 
             for batch_i, (imgs_A, imgs_B) in enumerate(self.data_loader.load_batch(batch_size=batch_size)):
 
@@ -552,9 +583,9 @@ class My3dPix2Pix():
                 
                 if self.fmloss:
                     valid_feat = self.discriminator_feat.predict([imgs_A, imgs_B])
-                    g_loss = self.combined.train_on_batch([imgs_A, imgs_B], [valid, imgs_A, valid_feat])
+                    g_loss = self.combined.train_on_batch(imgs_B, [valid, imgs_A, valid_feat])
                 else:
-                    g_loss = self.combined.train_on_batch([imgs_A, imgs_B], [valid, imgs_A])
+                    g_loss = self.combined.train_on_batch(imgs_B, [valid, imgs_A])
 
                 elapsed_time = datetime.datetime.now() - start_time
 
@@ -568,6 +599,19 @@ class My3dPix2Pix():
                 with open(os.path.join(self.savepath, 'log.txt'), 'a') as f:
                     f.write(newlog + '\n')
                 # f.close()
+
+                if metric_logger is not None:
+                    global_step = epoch * max(self.data_loader.n_batches, 1) + batch_i
+                    metric_logger({
+                        'train/d_loss_real': float(d_loss_real[0]),
+                        'train/d_loss_fake': float(d_loss_fake[0]),
+                        'train/d_acc_real': float(d_loss_real[1]),
+                        'train/d_acc_fake': float(d_loss_fake[1]),
+                        'train/g_loss': float(g_loss[0]),
+                        'train/lr': float(lr),
+                        'train/epoch': float(epoch + 1),
+                        'train/batch': float(batch_i + 1),
+                    }, global_step)
 
                 # If at save interval => save generated image samples
                 if (batch_i + 1) % sample_interval == 0:
@@ -631,7 +675,24 @@ class My3dPix2Pix():
 
 
     def load_weights(self, weightfile, summary=True):
-        loadweightspath = os.path.join(self.savepath, 'models', '{}.h5'.format(weightfile))
+        modelpath = os.path.join(self.savepath, 'models')
+        candidates = []
+
+        # Accept full filenames and stem-only values.
+        if weightfile.endswith('.weights.h5') or weightfile.endswith('.h5'):
+            candidates.append(os.path.join(modelpath, weightfile))
+        else:
+            candidates.append(os.path.join(modelpath, '{}.weights.h5'.format(weightfile)))
+            candidates.append(os.path.join(modelpath, '{}.h5'.format(weightfile)))  # legacy
+
+        loadweightspath = None
+        for path in candidates:
+            if os.path.exists(path):
+                loadweightspath = path
+                break
+        if loadweightspath is None:
+            raise FileNotFoundError("No weight file found for '{}'. Checked: {}".format(weightfile, candidates))
+
         self.combined.load_weights(loadweightspath)
         if summary:
             self.combined.summary()
@@ -639,9 +700,14 @@ class My3dPix2Pix():
 
     def load_final_weights(self, *args, **kwargs):
         wdir = os.path.join(self.savepath, 'models')
-        wlist = [os.path.splitext(x)[0] for x in os.listdir(wdir) if x.lower().endswith('.h5')]
-        wlist = [x for x in wlist if "temp" not in x]
-        wlist.sort()
+        wlist = []
+        for x in os.listdir(wdir):
+            xl = x.lower()
+            if xl.endswith('.weights.h5'):
+                wlist.append(x[:-len('.weights.h5')])
+            elif xl.endswith('.h5'):  # legacy
+                wlist.append(x[:-len('.h5')])
+        wlist = sorted(set(x for x in wlist if "temp" not in x))
 
         s = None
         for x in wlist:
@@ -659,8 +725,9 @@ class My3dPix2Pix():
 
     def save_weights(self, weightfile):
         modelpath = self.make_directory('models')
-        self.combined.save_weights(os.path.join(modelpath, '{}.h5'.format(weightfile)))
-        print('saved {}.h5 to {}'.format(weightfile, modelpath))
+        filename = '{}.weights.h5'.format(weightfile)
+        self.combined.save_weights(os.path.join(modelpath, filename))
+        print('saved {} to {}'.format(filename, modelpath))
 
 
 ########################################################################
