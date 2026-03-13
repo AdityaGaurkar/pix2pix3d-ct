@@ -120,11 +120,13 @@ def _log_case_metrics(metrics_list, prefix):
             "{}/psnr".format(prefix): float(m['psnr']),
             "{}/ssim".format(prefix): float(m['ssim']),
             "{}/nmse".format(prefix): float(m['nmse']),
+            "{}/dice".format(prefix): float(m['dice']),
         }, step=i)
     mlflow.log_metrics({
         "{}/psnr_mean".format(prefix): float(np.mean([x['psnr'] for x in metrics_list])),
         "{}/ssim_mean".format(prefix): float(np.mean([x['ssim'] for x in metrics_list])),
         "{}/nmse_mean".format(prefix): float(np.mean([x['nmse'] for x in metrics_list])),
+        "{}/dice_mean".format(prefix): float(np.mean([x['dice'] for x in metrics_list])),
         "{}/n_cases".format(prefix): float(len(metrics_list)),
     })
 

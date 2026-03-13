@@ -25,6 +25,36 @@ from source.data_loader import WND, rWND
 import matplotlib.pyplot as plt
 from scipy.stats import ttest_ind
 
+
+def dice_coefficient(y_true, y_pred, threshold=0.5, eps=1e-8):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    y_true_bin = y_true > threshold
+    y_pred_bin = y_pred > threshold
+
+    intersection = np.logical_and(y_true_bin, y_pred_bin).sum(dtype=np.float64)
+    size_true = y_true_bin.sum(dtype=np.float64)
+    size_pred = y_pred_bin.sum(dtype=np.float64)
+
+    if size_true + size_pred == 0:
+        return 1.0
+    return float((2.0 * intersection + eps) / (size_true + size_pred + eps))
+
+
+def _parse_metrics_line(line):
+    metrics_map = {}
+    for chunk in line.strip().split('] '):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        chunk = chunk.rstrip(']')
+        if not chunk.startswith('[') or ': ' not in chunk:
+            continue
+        key, value = chunk[1:].split(': ', 1)
+        metrics_map[key] = value
+    return metrics_map
+
 ###############################################################
 # * Functions
 ###############################################################
@@ -243,10 +273,10 @@ def loop_over_case(gan, case, savedir, notruth=False):
     :param case: A tuple containing patient ID (pid) and the z-stack size (zs) for the medical case.
     :param notruth: If True, generates images without using the ground truth data. Default is False.
     
-    This function generates synthetic medical images using a GAN for a specific case specified by 'pid' (patient ID) 
-    and 'zs' (z-stack size). The function prepares and processes the input images for the GAN and performs image 
-    generation using windows defined in the GAN's data loader. It then saves the generated images and calculates 
-    various image quality metrics such as PSNR, SSIM, and NMSE.
+    This function generates synthetic medical images using a GAN for a specific case specified by 'pid' (patient ID)
+    and 'zs' (z-stack size). The function prepares and processes the input images for the GAN and performs image
+    generation using windows defined in the GAN's data loader. It then saves the generated images and calculates
+    various image quality metrics such as PSNR, SSIM, NMSE, and Dice.
     """
     pid, zs = case
     print("Handling", pid)
@@ -397,9 +427,9 @@ def loop_over_case(gan, case, savedir, notruth=False):
         nmse = np.mean((img_original - img_generated) ** 2, dtype=np.float64) / (
             np.mean((img_original) ** 2, dtype=np.float64) + 1e-8
         )
-        #print("NMSE: {}".format(nmse))
+        dice = dice_coefficient(img_original, img_generated)
 
-        newlog = "[PID: %s] [PSNR: %f] [SSIM: %f] [NMSE: %f]" % (pid, psnr, mssim, nmse)
+        newlog = "[PID: %s] [PSNR: %f] [SSIM: %f] [NMSE: %f] [DICE: %f]" % (pid, psnr, mssim, nmse, dice)
 
         print(newlog)
         with open(os.path.join(savedir, 'log.txt'), 'a') as f:
@@ -409,6 +439,7 @@ def loop_over_case(gan, case, savedir, notruth=False):
             'psnr': float(psnr),
             'ssim': float(mssim),
             'nmse': float(nmse),
+            'dice': float(dice),
         }
 
     return None
@@ -563,8 +594,8 @@ def plot_metrics(input_dir):
     
     :param input_dir: The directory containing the log file with model metrics.
     
-    This function reads model metrics (PSNR, SSIM, NMSE) from a log file in the specified input directory.
-    It then creates three boxplots for each metric (PSNR, SSIM, NMSE) and labels the outliers on the plots
+    This function reads model metrics (PSNR, SSIM, NMSE, DICE) from a log file in the specified input directory.
+    It then creates four boxplots for each metric and labels the outliers on the plots
     with their corresponding patient IDs. The patient IDs are retrieved from the log file and matched with the
     outlier values. The resulting plots are saved as an image file.
     """
@@ -573,24 +604,23 @@ def plot_metrics(input_dir):
     psnr = []
     ssim = []
     nmse = []
+    dice = []
 
     # Read and parse metrics from the log file
     with open(os.path.join(input_dir,'log.txt'), 'r') as f:
         for line in f.readlines():
-            line = line.strip()
-            id,ps,ss,nm = line.split('] ')
-            id = id.replace('[PID: ','')
-            ps = ps.replace('[PSNR: ','')
-            ss = ss.replace('[SSIM: ','')
-            nm = nm.replace('[NMSE: ','').replace(']','')
-            
-            pid.append(str(id))
-            psnr.append(float(ps))
-            ssim.append(float(ss))
-            nmse.append(float(nm))
+            metrics_map = _parse_metrics_line(line)
+            if not metrics_map:
+                continue
+
+            pid.append(str(metrics_map['PID']))
+            psnr.append(float(metrics_map['PSNR']))
+            ssim.append(float(metrics_map['SSIM']))
+            nmse.append(float(metrics_map['NMSE']))
+            dice.append(float(metrics_map.get('DICE', 'nan')))
     
     # Create boxplots
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
     
     # PSNR boxplot
     psnr_box = axes[0].boxplot([psnr])
@@ -606,6 +636,11 @@ def plot_metrics(input_dir):
     nmse_box = axes[2].boxplot([nmse])
     axes[2].set_title('NMSE')
     axes[2].set_xticklabels(['NMSE'])
+
+    # DICE boxplot
+    dice_box = axes[3].boxplot([dice])
+    axes[3].set_title('DICE')
+    axes[3].set_xticklabels(['DICE'])
     
     # Add labels for outliers
     def label_outliers(ax, box, data, labels):
@@ -621,6 +656,7 @@ def plot_metrics(input_dir):
     label_outliers(axes[0], psnr_box, psnr, pid)
     label_outliers(axes[1], ssim_box, ssim, pid)
     label_outliers(axes[2], nmse_box, nmse, pid)
+    label_outliers(axes[3], dice_box, dice, pid)
     
     # Save boxplots
     fig.suptitle('Model metrics')
@@ -634,8 +670,8 @@ def plot_2_metrics(input_dirs):
     
     :param input_dir: The directory containing the log file with model metrics.
     
-    This function reads model metrics (PSNR, SSIM, NMSE) from a log file in the specified input directory.
-    It then creates three boxplots for each metric (PSNR, SSIM, NMSE) and labels the outliers on the plots
+    This function reads model metrics (PSNR, SSIM, NMSE, DICE) from a log file in the specified input directory.
+    It then creates boxplots for each metric and labels the outliers on the plots
     with their corresponding patient IDs. The patient IDs are retrieved from the log file and matched with the
     outlier values. The resulting plots are saved as an image file.
     """
@@ -648,32 +684,32 @@ def plot_2_metrics(input_dirs):
         psnr = []
         ssim = []
         nmse = []
+        dice = []
 
         # Read and parse metrics from the log file
         with open(os.path.join(input_dir,'log.txt'), 'r') as f:
             for line in f.readlines():
-                line = line.strip()
-                id,ps,ss,nm = line.split('] ')
-                id = id.replace('[PID: ','')
-                ps = ps.replace('[PSNR: ','')
-                ss = ss.replace('[SSIM: ','')
-                nm = nm.replace('[NMSE: ','').replace(']','')
+                metrics_map = _parse_metrics_line(line)
+                if not metrics_map:
+                    continue
 
-                pid.append(str(id))
-                psnr.append(float(ps))
-                ssim.append(float(ss))
-                nmse.append(float(nm))
+                pid.append(str(metrics_map['PID']))
+                psnr.append(float(metrics_map['PSNR']))
+                ssim.append(float(metrics_map['SSIM']))
+                nmse.append(float(metrics_map['NMSE']))
+                dice.append(float(metrics_map.get('DICE', 'nan')))
 
         # Store results in the dictionary
         results[input_dir] = {
             'pid': pid,
             'psnr': psnr,
             'ssim': ssim,
-            'nmse': nmse
+            'nmse': nmse,
+            'dice': dice,
         }
 
     # Create boxplots
-    fig, axes = plt.subplots(1, 3, figsize=(12, 5))
+    fig, axes = plt.subplots(1, 4, figsize=(16, 5))
 
     # PSNR boxplot
     psnr_box = axes[0].boxplot([results[dir]['psnr'] for dir in input_dirs], positions=[1, 1.5])
@@ -701,6 +737,12 @@ def plot_2_metrics(input_dirs):
     axes[2].set_xlim(0.85, 1.65)
     #axes[2].set_xticks([1, 1.4])
     axes[2].set_xticklabels([r'$Data_{woA}$', r'$Data_{wA}$'])
+
+    # DICE boxplot
+    dice_box = axes[3].boxplot([results[dir]['dice'] for dir in input_dirs], positions=[1, 1.5])
+    axes[3].set_title('DICE')
+    axes[3].set_xlim(0.85, 1.65)
+    axes[3].set_xticklabels([r'$Data_{woA}$', r'$Data_{wA}$'])
 
     # Save boxplots
     plt.tight_layout()

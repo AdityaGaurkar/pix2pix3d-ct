@@ -506,7 +506,7 @@ class My3dPix2Pix():
 
 
     def train(self, epochs, batch_size=1, sample_interval=200, model_interval=-1, epoch_start: int = 0,
-              metric_logger=None):
+              metric_logger=None, save_temp_weights=True, save_final_weights=True):
 
         start_time = datetime.datetime.now()
 
@@ -617,7 +617,8 @@ class My3dPix2Pix():
                 if (batch_i + 1) % sample_interval == 0:
                     self.sample_images(epoch, batch_i + 1)
 
-                    self.save_weights('temp')
+                    if save_temp_weights:
+                        self.save_weights('temp')
 
             # save weights
             if model_interval > 0:
@@ -626,7 +627,7 @@ class My3dPix2Pix():
 
         # final sample image & save weights
         self.sample_images(epochs, 'final')
-        if model_interval > 0:
+        if save_final_weights:
             self.save_weights('final{}'.format(str(epochs)))
 
 

@@ -82,6 +82,91 @@ def _experiment_name_from_output_dir(path):
     return name or "pix2pix3d-ct"
 
 
+def _parse_env_tuple(name, cast_type, expected_len):
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+
+    seq = None
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, (list, tuple)):
+            seq = list(parsed)
+    except Exception:
+        seq = None
+
+    if seq is None:
+        seq = [x.strip() for x in raw.split(',') if x.strip()]
+
+    if len(seq) != expected_len:
+        raise ValueError(
+            "{} must have {} values, got {} from '{}'".format(name, expected_len, len(seq), raw)
+        )
+    return tuple(cast_type(x) for x in seq)
+
+
+def _runtime_overrides_from_env():
+    overrides = {}
+    grid = _parse_env_tuple("P2P_GRID", int, 3)
+    if grid is not None:
+        overrides["grid"] = grid
+
+    lrs = _parse_env_tuple("P2P_LRS", float, 2)
+    if lrs is not None:
+        overrides["lrs"] = lrs
+
+    l_weights = _parse_env_tuple("P2P_L_WEIGHTS", float, 2)
+    if l_weights is not None:
+        overrides["L_weights"] = l_weights
+
+    epochs_raw = os.environ.get("P2P_EPOCHS")
+    if epochs_raw:
+        overrides["epochs"] = int(epochs_raw)
+
+    model_interval_raw = os.environ.get("P2P_MODEL_INTERVAL")
+    if model_interval_raw:
+        overrides["model_interval"] = int(model_interval_raw)
+
+    sample_interval_raw = os.environ.get("P2P_SAMPLE_INTERVAL")
+    if sample_interval_raw:
+        overrides["sample_interval"] = int(sample_interval_raw)
+
+    def _parse_bool_env(name):
+        raw = os.environ.get(name)
+        if raw is None:
+            return None
+        raw = raw.strip().lower()
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+        raise ValueError("Unsupported boolean value for {}: '{}'".format(name, raw))
+
+    save_temp_weights = _parse_bool_env("P2P_SAVE_TEMP_WEIGHTS")
+    if save_temp_weights is not None:
+        overrides["save_temp_weights"] = save_temp_weights
+
+    save_final_weights = _parse_bool_env("P2P_SAVE_FINAL_WEIGHTS")
+    if save_final_weights is not None:
+        overrides["save_final_weights"] = save_final_weights
+
+    return overrides
+
+
+def _apply_runtime_overrides(cfg, overrides):
+    for k, v in overrides.items():
+        cfg[k] = v
+
+
+def _cfg_filename(cfg):
+    img_shape = tuple(cfg.get("img_shape", c.img_shape))
+    grid = tuple(cfg.get("grid", c.grid))
+    return c.get_cfg_filename(img_shape, grid)
+
+
 ########################################################################
 # * Configuration
 ########################################################################
@@ -104,15 +189,18 @@ output_dir = os.path.join(root, model_name)
 
 os.makedirs(output_dir, exist_ok=True)
 
+runtime_overrides = _runtime_overrides_from_env()
+runtime_grid = runtime_overrides.get("grid", c.grid)
 
 ### load config OR create a new one
-cfg_path = os.path.join(output_dir, c.get_cfg_filename(c.img_shape, c.grid))
+cfg_path = os.path.join(output_dir, c.get_cfg_filename(c.img_shape, runtime_grid))
 
 if os.path.exists(cfg_path):
     print("Loading existing config: {}".format(cfg_path))
     with open(cfg_path) as json_file:
         cfg = json.load(json_file)
     normalize_cfg_paths(cfg, train_dir, output_dir)
+    _apply_runtime_overrides(cfg, runtime_overrides)
 else:
     print("Creating new config:", cfg_path)
     ## new config
@@ -130,6 +218,8 @@ else:
         'L_weights': c.L_weights,
         'sample_interval': c.sample_interval,
         'model_interval': c.model_interval,
+        'save_temp_weights': c.save_temp_weights,
+        'save_final_weights': c.save_final_weights,
         'grid': c.grid,
         'splitvar': c.splitvar,
         'resizeconv': c.resizeconv,
@@ -144,6 +234,7 @@ else:
         'fmloss': c.fmloss,
         'multigpu': c.multigpu,
     }
+    _apply_runtime_overrides(cfg, runtime_overrides)
 
 # print(json.dumps(cfg, indent=2))
 
@@ -185,7 +276,8 @@ split_path = os.path.join(output_dir, 'split.pkl')
 DL.save_split(split_path)
 cfg['splitvar'] = split_path
 
-with open(os.path.join(output_dir, c.get_cfg_filename(c.img_shape, c.grid)), 'w') as json_file:
+cfg_output_path = os.path.join(output_dir, _cfg_filename(cfg))
+with open(cfg_output_path, 'w') as json_file:
     json.dump(cfg, json_file)
 
 
@@ -260,7 +352,9 @@ def _metric_logger(metrics_dict, step):
 run_status = "FINISHED"
 try:
     gan.train(epochs=cfg['epochs'], batch_size=cfg['batch_size'], sample_interval=cfg['sample_interval'],
-              model_interval=cfg['model_interval'], epoch_start=epoch, metric_logger=_metric_logger)
+              model_interval=cfg['model_interval'], epoch_start=epoch, metric_logger=_metric_logger,
+              save_temp_weights=cfg.get('save_temp_weights', True),
+              save_final_weights=cfg.get('save_final_weights', True))
     ########################################################################
     # * Plot
     ########################################################################
@@ -271,7 +365,7 @@ except Exception:
 finally:
     if mlflow_active:
         artifacts = [
-            os.path.join(output_dir, c.get_cfg_filename(c.img_shape, c.grid)),
+            cfg_output_path,
             os.path.join(output_dir, "log.txt"),
             os.path.join(output_dir, "loss.png"),
             split_path,

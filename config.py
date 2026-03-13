@@ -33,7 +33,7 @@ window2 = [(8000, 3000)]
 
 
 batch_size = 3
-epochs = 1
+epochs = 100
 
 
 optimizer = 'adam'
@@ -41,6 +41,8 @@ learning_rates = (0.00018, 0.1)
 L_weights = (1, 100)
 sample_interval = 128
 model_interval = 1
+save_temp_weights = True
+save_final_weights = True
 
 
 splitvar = 1.0
